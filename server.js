@@ -1,4 +1,4 @@
-// Nueva versión del backend: acepta JPG, PNG comunes y genera una imagen estilo dibujo
+// Versión corregida del backend: usa images.generate()
 
 const express = require('express');
 const multer = require('multer');
@@ -17,14 +17,8 @@ const openai = new OpenAI({
 
 app.post('/convert', upload.single('image'), async (req, res) => {
   try {
-    const imagePath = req.file.path;
-    const imageBuffer = fs.readFileSync(imagePath);
-    const base64Image = imageBuffer.toString('base64');
-    const mimeType = req.file.mimetype; // e.g., image/jpeg
-
-    // Generar una imagen nueva a partir de una descripción
     const style = req.body.style || "artistic";
-    const prompt = `Turn this image into a ${style}-style artistic drawing.`;
+    const prompt = `A ${style} style artistic drawing of a portrait`;
 
     const response = await openai.images.generate({
       prompt,
