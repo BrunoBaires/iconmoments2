@@ -1,11 +1,11 @@
-// server.js
+// server.js actualizado para usar Replicate (SDXL ControlNet) y OpenAI solo para el prompt
 import express from "express";
 import multer from "multer";
 import fetch from "node-fetch";
-import { Configuration, OpenAIApi } from "openai";
-import dotenv from "dotenv";
 import fs from "fs";
 import FormData from "form-data";
+import path from "path";
+import dotenv from "dotenv";
 
 dotenv.config();
 
@@ -13,63 +13,92 @@ const app = express();
 const port = process.env.PORT || 3000;
 const upload = multer({ dest: "uploads/" });
 
-const configuration = new Configuration({
-  apiKey: process.env.OPENAI_API_KEY,
-});
-const openai = new OpenAIApi(configuration);
-
 app.use(express.static("public"));
-app.use(express.json());
 
-app.post("/generate", upload.single("image"), async (req, res) => {
+app.post("/convert", upload.single("image"), async (req, res) => {
   try {
     const style = req.body.style;
     const imagePath = req.file.path;
 
-    // 1. Usamos GPT para crear un prompt estilizado
-    const gptResponse = await openai.createChatCompletion({
-      model: "gpt-4",
-      messages: [
-        {
-          role: "system",
-          content:
-            "Sos un generador de prompts visuales. Recibís un estilo y devolvés una descripción estilizada para aplicar a una imagen usando IA artística.",
-        },
-        {
-          role: "user",
-          content: `Estilo: ${style}`,
-        },
-      ],
-    });
+    // Lee la imagen
+    const imageBuffer = fs.readFileSync(imagePath);
+    const base64Image = `data:image/jpeg;base64,${imageBuffer.toString("base64")}`;
 
-    const prompt = gptResponse.data.choices[0].message.content;
-
-    // 2. Usamos Replicate con instruct-pix2pix
-    const form = new FormData();
-    form.append("version", "7e75803c1c7c4e62f40d38f9cf61a0bd4bcfc1e88e5601e0c74c2c1ab4e8b1d4");
-    form.append("input", JSON.stringify({ prompt }));
-    form.append("image", fs.createReadStream(imagePath));
-
-    const response = await fetch("https://api.replicate.com/v1/predictions", {
+    // Genera el prompt estilizado con GPT
+    const gptResponse = await fetch("https://api.openai.com/v1/chat/completions", {
       method: "POST",
       headers: {
-        Authorization: `Token ${process.env.REPLICATE_API_TOKEN}`,
-        ...form.getHeaders(),
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
       },
-      body: form,
+      body: JSON.stringify({
+        model: "gpt-4",
+        messages: [
+          {
+            role: "system",
+            content:
+              "Sos un experto en arte y estilos visuales. Tu tarea es convertir descripciones de estilos en prompts detallados para un modelo de ilustración. El estilo debe ser: " + style,
+          },
+          {
+            role: "user",
+            content:
+              "Generá un prompt para aplicar este estilo a una foto de una persona, manteniendo fidelidad a sus rasgos pero transformándola en una ilustración. Incluí elementos técnicos como paleta de colores, trazo, iluminación, encuadre y composición.",
+          },
+        ],
+      }),
     });
 
-    const data = await response.json();
+    const gptData = await gptResponse.json();
+    const finalPrompt = gptData.choices[0].message.content;
 
-    // 3. Devolvemos el link para que el frontend lo muestre
-    if (data.urls && data.urls.get) {
-      res.json({ status: "processing", url: data.urls.get });
+    // Llama al modelo SDXL + ControlNet (Replicate)
+    const replicateResponse = await fetch("https://api.replicate.com/v1/predictions", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Token ${process.env.REPLICATE_API_TOKEN}`,
+      },
+      body: JSON.stringify({
+        version: "f6b740016d3b4aa1fb2f706c5c025e9d3b2093e7e094ab5c7f4864ccedb1440b", // sdxl-controlnet canny
+        input: {
+          image: base64Image,
+          prompt: finalPrompt,
+          a_prompt: "",
+          n_prompt: "ugly, disfigured, low quality",
+          num_inference_steps: 30,
+          width: 1024,
+          height: 1024,
+          apply_canny: true,
+        },
+      }),
+    });
+
+    const replicateData = await replicateResponse.json();
+
+    if (replicateData?.urls?.get) {
+      // Poll the prediction endpoint until status is "succeeded"
+      const statusUrl = replicateData.urls.get;
+      let finalImage = null;
+      for (let i = 0; i < 20; i++) {
+        const statusResponse = await fetch(statusUrl, {
+          headers: { Authorization: `Token ${process.env.REPLICATE_API_TOKEN}` },
+        });
+        const statusData = await statusResponse.json();
+        if (statusData.status === "succeeded") {
+          finalImage = statusData.output[0];
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 3000));
+      }
+
+      fs.unlinkSync(imagePath);
+      return res.json({ image: finalImage });
     } else {
-      res.status(500).json({ error: "No se pudo procesar la imagen." });
+      throw new Error("No se pudo generar la imagen");
     }
   } catch (error) {
-    console.error("Error:", error);
-    res.status(500).json({ error: "Fallo en el servidor." });
+    console.error("Error en el backend:", error);
+    res.status(500).json({ error: "Error al procesar la imagen" });
   }
 });
 
