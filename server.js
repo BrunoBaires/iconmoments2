@@ -1,107 +1,67 @@
-// server.js actualizado para usar Replicate (SDXL ControlNet) y OpenAI solo para el prompt
 import express from "express";
 import multer from "multer";
-import fetch from "node-fetch";
 import fs from "fs";
-import FormData from "form-data";
-import path from "path";
+import Replicate from "replicate";
+import { OpenAI } from "openai";
 import dotenv from "dotenv";
+import path from "path";
 
 dotenv.config();
-
 const app = express();
 const port = process.env.PORT || 3000;
-const upload = multer({ dest: "uploads/" });
 
+const upload = multer({ dest: "uploads/" });
 app.use(express.static("public"));
 
-app.post("/convert", upload.single("image"), async (req, res) => {
-  try {
-    const style = req.body.style;
-    const imagePath = req.file.path;
-
-    // Lee la imagen
-    const imageBuffer = fs.readFileSync(imagePath);
-    const base64Image = `data:image/jpeg;base64,${imageBuffer.toString("base64")}`;
-
-    // Genera el prompt estilizado con GPT
-    const gptResponse = await fetch("https://api.openai.com/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-      },
-      body: JSON.stringify({
-        model: "gpt-4",
-        messages: [
-          {
-            role: "system",
-            content:
-              "Sos un experto en arte y estilos visuales. Tu tarea es convertir descripciones de estilos en prompts detallados para un modelo de ilustración. El estilo debe ser: " + style,
-          },
-          {
-            role: "user",
-            content:
-              "Generá un prompt para aplicar este estilo a una foto de una persona, manteniendo fidelidad a sus rasgos pero transformándola en una ilustración. Incluí elementos técnicos como paleta de colores, trazo, iluminación, encuadre y composición.",
-          },
-        ],
-      }),
-    });
-
-    const gptData = await gptResponse.json();
-    const finalPrompt = gptData.choices[0].message.content;
-
-    // Llama al modelo SDXL + ControlNet (Replicate)
-    const replicateResponse = await fetch("https://api.replicate.com/v1/predictions", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Token ${process.env.REPLICATE_API_TOKEN}`,
-      },
-      body: JSON.stringify({
-        version: "f6b740016d3b4aa1fb2f706c5c025e9d3b2093e7e094ab5c7f4864ccedb1440b", // sdxl-controlnet canny
-        input: {
-          image: base64Image,
-          prompt: finalPrompt,
-          a_prompt: "",
-          n_prompt: "ugly, disfigured, low quality",
-          num_inference_steps: 30,
-          width: 1024,
-          height: 1024,
-          apply_canny: true,
-        },
-      }),
-    });
-
-    const replicateData = await replicateResponse.json();
-
-    if (replicateData?.urls?.get) {
-      // Poll the prediction endpoint until status is "succeeded"
-      const statusUrl = replicateData.urls.get;
-      let finalImage = null;
-      for (let i = 0; i < 20; i++) {
-        const statusResponse = await fetch(statusUrl, {
-          headers: { Authorization: `Token ${process.env.REPLICATE_API_TOKEN}` },
-        });
-        const statusData = await statusResponse.json();
-        if (statusData.status === "succeeded") {
-          finalImage = statusData.output[0];
-          break;
-        }
-        await new Promise((resolve) => setTimeout(resolve, 3000));
-      }
-
-      fs.unlinkSync(imagePath);
-      return res.json({ image: finalImage });
-    } else {
-      throw new Error("No se pudo generar la imagen");
-    }
-  } catch (error) {
-    console.error("Error en el backend:", error);
-    res.status(500).json({ error: "Error al procesar la imagen" });
-  }
+const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY,
 });
 
-app.listen(port, () => {
-  console.log(`Servidor corriendo en puerto ${port}`);
+const replicateApiToken = fs.readFileSync('/etc/secrets/REPLICATE_API_TOKEN', 'utf8').trim();
+const replicate = new Replicate({ auth: replicateApiToken });
+
+app.post("/process", upload.single("image"), async (req, res) => {
+  const imagePath = req.file.path;
+  const style = req.body.style;
+
+  try {
+    const imageBase64 = fs.readFileSync(imagePath, { encoding: "base64" });
+
+    const gptResponse = await openai.chat.completions.create({
+      model: "gpt-4",
+      messages: [
+        {
+          role: "user",
+          content: `Quiero que me des un prompt detallado para un modelo de imagen AI (como SDXL o ControlNet), que transforme una fotografía real en una ilustración con el estilo gráfico de la tapa de The New Yorker del 27 de noviembre de 2023, dibujada por Chris Ware. Describí el estilo de ilustración, colores, nivel de detalle, técnica y enfoque.`,
+        },
+      ],
+    });
+
+    const prompt = gptResponse.choices[0].message.content.trim();
+
+    const prediction = await replicate.run(
+      "fofr/controlnet-sdxl:be1cfc032d9e9ed289a914b07b5c865ceac3b6e67b3e3f42e0235120c38c485b",
+      {
+        input: {
+          image: `data:image/jpeg;base64,${imageBase64}`,
+          prompt: prompt,
+          structure: "canny",
+          scale: 9,
+          num_inference_steps: 30,
+        },
+      }
+    );
+
+    // Si es un array de frames, usamos el último resultado
+    const finalImage = Array.isArray(prediction) ? prediction[prediction.length - 1] : prediction;
+
+    fs.unlinkSync(imagePath); // Borra la imagen temporal
+
+    res.json({ image: finalImage });
+
+  } catch (error) {
+    console.error("Error en el backend:", error);
+    fs.existsSync(imagePath) && fs.unlinkSync(imagePath); // Cleanup por si falla
+    res.status(500).json({ error: "Error al procesar la imagen" });
+  }
 });
