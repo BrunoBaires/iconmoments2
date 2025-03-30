@@ -9,11 +9,11 @@ const app = express();
 app.use(cors());
 const upload = multer({ dest: 'uploads/' });
 
-const configuration = new Configuration({
-  apiKey: process.env.OPENAI_API_KEY,
-});
-const openai = new OpenAIApi(configuration);
+const OpenAI = require("openai");
 
+const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY
+});
 app.post('/convert', upload.single('image'), async (req, res) => {
   try {
     const imagePath = req.file.path;
